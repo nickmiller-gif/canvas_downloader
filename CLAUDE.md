@@ -25,7 +25,7 @@ The only external dependency is `requests`. Do not introduce others unless there
 
 Both scripts must remain safe to re-run against an already-populated download directory.
 
-- `canvas_downloader.py`: `download_file()` checks `dest_path.exists()` before writing; `save_html()` does the same
+- `canvas_downloader.py`: `download_file()` checks `dest_path.exists()` before writing; `save_html()` does the same; `generate_course_index()` always regenerates since content may change between runs
 - `canvas_link_harvester.py`: `_link_manifest.json` at the root of `CANVAS_DOWNLOAD_DIR` tracks every processed URL; only unrecorded URLs are attempted each run
 
 ## Output layout
@@ -37,6 +37,11 @@ CANVAS_DOWNLOAD_DIR/
     index.html
     files/
     assignments/
+    submissions/
+      {Assignment Name}/
+    discussions/
+      announcements/
+      discussion_topics/
     modules/
       {Module Name}/
         {Page}.html

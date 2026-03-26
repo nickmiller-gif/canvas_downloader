@@ -55,14 +55,17 @@ python canvas_downloader.py
 
 This will:
 - Authenticate and list every course you're enrolled in (active and completed)
+- Prompt you to select specific courses (or press Enter to download all)
 - For each course, download:
-  - **Files** — everything in the course Files section, organized by folder
+  - **Files** — everything in the course Files section, organized by folder (downloaded in parallel)
   - **Assignments** — descriptions and rubrics saved as HTML
   - **Modules & Pages** — module structure and all page content as HTML; files linked inside modules are downloaded directly
   - **Standalone pages** — any pages not inside a module
+  - **Submissions** — your own submitted work (file uploads, text entries, URLs) and grades
+  - **Discussions & Announcements** — topic content and threaded replies
 - Generate an `index.html` per course linking to all downloaded content
 
-Re-running is safe — binary files already on disk are skipped automatically.
+Re-running is safe — files already on disk are skipped automatically. Transient errors (429, 5xx) are retried with exponential backoff.
 
 ### Step 2 — Harvest linked content from HTML files
 
@@ -106,6 +109,19 @@ The harvester is also re-run safe — every processed link is recorded in `~/CMU
 │   ├── assignments/
 │   │   ├── Homework 1.html
 │   │   └── Final Project.html
+│   │
+│   ├── submissions/
+│   │   ├── Homework 1/
+│   │   │   ├── my_solution.pdf
+│   │   │   └── grade.html
+│   │   └── Final Project/
+│   │       └── submission_text.html
+│   │
+│   ├── discussions/
+│   │   ├── announcements/
+│   │   │   └── Welcome to the Course.html
+│   │   └── discussion_topics/
+│   │       └── Week 1 Discussion.html
 │   │
 │   ├── modules/
 │   │   ├── Week 1 - Introduction/
@@ -167,7 +183,10 @@ Additional tunables at the top of each script:
 | `DOWNLOAD_FILES` | `True` | Toggle file section downloads |
 | `DOWNLOAD_ASSIGNMENTS` | `True` | Toggle assignment downloads |
 | `DOWNLOAD_MODULES_AND_PAGES` | `True` | Toggle module/page downloads |
+| `DOWNLOAD_SUBMISSIONS` | `True` | Toggle submission/grade downloads |
+| `DOWNLOAD_DISCUSSIONS` | `True` | Toggle discussion/announcement downloads |
 | `REQUEST_DELAY` | `0.15` | Seconds between API requests |
+| `MAX_DOWNLOAD_WORKERS` | `4` | Concurrent file download threads |
 
 **`canvas_link_harvester.py`**
 

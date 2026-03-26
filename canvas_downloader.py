@@ -22,6 +22,8 @@ import time
 import requests
 from pathlib import Path
 from urllib.parse import urlparse, unquote
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
 
 # ──────────────────────────────────────────────
 # CONFIGURATION — Edit these or set env vars
@@ -34,10 +36,15 @@ DOWNLOAD_DIR = os.environ.get("CANVAS_DOWNLOAD_DIR", os.path.expanduser("~/CMU")
 DOWNLOAD_FILES = True
 DOWNLOAD_ASSIGNMENTS = True
 DOWNLOAD_MODULES_AND_PAGES = True
+DOWNLOAD_SUBMISSIONS = True
+DOWNLOAD_DISCUSSIONS = True
 
 # Rate limiting (Canvas API typically allows 10 req/sec)
 REQUEST_DELAY = 0.15  # seconds between requests
+MAX_DOWNLOAD_WORKERS = 4  # concurrent file download threads
 # ──────────────────────────────────────────────
+
+print_lock = Lock()
 
 
 session = requests.Session()
@@ -90,31 +97,56 @@ def api_get(endpoint: str, params: dict = None) -> list | dict:
     return all_results
 
 
-def download_file(url: str, dest_path: Path) -> bool:
-    """Download a file from a URL to a local path."""
+def download_file(url: str, dest_path: Path, prefix: str = "    ", max_retries: int = 3) -> bool:
+    """Download a file from a URL to a local path, with retry on transient errors."""
     if dest_path.exists():
-        print(f"    ✓ Already exists: {dest_path.name}")
+        with print_lock:
+            print(f"{prefix}✓ Already exists: {dest_path.name}")
         return True
 
     dest_path.parent.mkdir(parents=True, exist_ok=True)
-    time.sleep(REQUEST_DELAY)
 
-    try:
-        resp = session.get(url, stream=True, allow_redirects=True)
-        resp.raise_for_status()
-        with open(dest_path, "wb") as f:
-            for chunk in resp.iter_content(chunk_size=8192):
-                f.write(chunk)
-        print(f"    ↓ Downloaded: {dest_path.name}")
-        return True
-    except Exception as e:
-        print(f"    ✗ Failed to download {dest_path.name}: {e}")
-        return False
+    for attempt in range(1, max_retries + 1):
+        time.sleep(REQUEST_DELAY)
+        try:
+            resp = session.get(url, stream=True, allow_redirects=True)
+            if resp.status_code in (429, 500, 502, 503, 504) and attempt < max_retries:
+                wait = REQUEST_DELAY * (2 ** attempt)
+                with print_lock:
+                    print(f"{prefix}⟳ {resp.status_code} — retrying in {wait:.1f}s ({attempt}/{max_retries})")
+                time.sleep(wait)
+                continue
+            resp.raise_for_status()
+            with open(dest_path, "wb") as f:
+                for chunk in resp.iter_content(chunk_size=8192):
+                    f.write(chunk)
+            with print_lock:
+                print(f"{prefix}↓ Downloaded: {dest_path.name}")
+            return True
+        except requests.exceptions.ConnectionError:
+            if attempt < max_retries:
+                wait = REQUEST_DELAY * (2 ** attempt)
+                with print_lock:
+                    print(f"{prefix}⟳ Connection error — retrying in {wait:.1f}s ({attempt}/{max_retries})")
+                time.sleep(wait)
+                continue
+            with print_lock:
+                print(f"{prefix}✗ Failed to download {dest_path.name}: connection error after {max_retries} attempts")
+            return False
+        except Exception as e:
+            with print_lock:
+                print(f"{prefix}✗ Failed to download {dest_path.name}: {e}")
+            return False
+    return False
 
 
 def save_html(content: str, dest_path: Path, title: str = ""):
     """Save HTML content wrapped in a basic page structure."""
     if not content or not content.strip():
+        return
+
+    if dest_path.exists():
+        print(f"    ✓ Already exists: {dest_path.name}")
         return
 
     dest_path.parent.mkdir(parents=True, exist_ok=True)
@@ -191,30 +223,49 @@ def download_course_files(course_id: int, course_dir: Path):
         return
 
     files_dir = course_dir / "files"
+    folder_cache = {}  # folder_id -> resolved sub_dir Path
 
+    # Resolve folder paths first (requires API calls, done sequentially)
+    download_tasks = []  # list of (url, dest_path)
     for f in files:
         if not isinstance(f, dict):
             continue
 
         filename = sanitize_filename(f.get("display_name", f.get("filename", "unknown")))
-        folder_name = f.get("folder_id", "")
+        folder_id = f.get("folder_id", "")
 
-        # Try to get the folder path for organization
         sub_dir = files_dir
-        if folder_name:
-            try:
-                folder = api_get(f"courses/{course_id}/folders/{folder_name}")
-                if isinstance(folder, dict) and "full_name" in folder:
-                    # full_name looks like "course files/Week 1/Readings"
-                    rel_path = folder["full_name"].replace("course files", "").strip("/")
-                    if rel_path:
-                        sub_dir = files_dir / sanitize_filename(rel_path)
-            except Exception:
-                pass
+        if folder_id:
+            if folder_id not in folder_cache:
+                try:
+                    folder = api_get(f"courses/{course_id}/folders/{folder_id}")
+                    if isinstance(folder, dict) and "full_name" in folder:
+                        rel_path = folder["full_name"].replace("course files", "").strip("/")
+                        if rel_path:
+                            parts = rel_path.split("/")
+                            sanitized = Path(*[sanitize_filename(p) for p in parts])
+                            folder_cache[folder_id] = files_dir / sanitized
+                        else:
+                            folder_cache[folder_id] = files_dir
+                    else:
+                        folder_cache[folder_id] = files_dir
+                except Exception:
+                    folder_cache[folder_id] = files_dir
+            sub_dir = folder_cache[folder_id]
 
         download_url = f.get("url")
         if download_url:
-            download_file(download_url, sub_dir / filename)
+            download_tasks.append((download_url, sub_dir / filename))
+
+    # Download files in parallel
+    total = len(download_tasks)
+    with ThreadPoolExecutor(max_workers=MAX_DOWNLOAD_WORKERS) as pool:
+        futures = {
+            pool.submit(download_file, url, dest, f"    [{i}/{total}] "): i
+            for i, (url, dest) in enumerate(download_tasks, 1)
+        }
+        for future in as_completed(futures):
+            future.result()  # propagate exceptions
 
 
 def download_assignments(course_id: int, course_dir: Path):
@@ -342,8 +393,166 @@ def download_modules_and_pages(course_id: int, course_dir: Path):
                         save_html(body, pages_dir / f"{sanitize_filename(title)}.html", title=title)
 
 
+def download_submissions(course_id: int, course_dir: Path):
+    """Download the user's own assignment submissions."""
+    print("  📤 Fetching submissions...")
+    assignments = api_get(f"courses/{course_id}/assignments", params={"per_page": 100})
+    if not assignments:
+        print("    (no assignments found)")
+        return
+
+    submissions_dir = course_dir / "submissions"
+
+    for a in assignments:
+        if not isinstance(a, dict):
+            continue
+
+        assignment_id = a["id"]
+        assignment_name = sanitize_filename(a.get("name", f"Assignment_{assignment_id}"))
+
+        submission = api_get(f"courses/{course_id}/assignments/{assignment_id}/submissions/self")
+        if not isinstance(submission, dict):
+            continue
+
+        # Skip if nothing was submitted
+        workflow_state = submission.get("workflow_state", "")
+        if workflow_state == "unsubmitted":
+            continue
+
+        sub_dir = submissions_dir / assignment_name
+        saved_anything = False
+
+        # Download attachments (file uploads)
+        attachments = submission.get("attachments", [])
+        for att in attachments:
+            if not isinstance(att, dict):
+                continue
+            url = att.get("url")
+            fname = sanitize_filename(att.get("display_name", att.get("filename", "submission")))
+            if url:
+                download_file(url, sub_dir / fname)
+                saved_anything = True
+
+        # Save submission body (online text entry)
+        body = submission.get("body", "") or ""
+        if body.strip():
+            save_html(body, sub_dir / "submission_text.html", title=f"Submission — {a.get('name', '')}")
+            saved_anything = True
+
+        # Save submission URL (URL submissions)
+        sub_url = submission.get("url", "") or ""
+        if sub_url.strip():
+            link_html = f'<p>Submitted URL: <a href="{sub_url}" target="_blank">{sub_url}</a></p>'
+            save_html(link_html, sub_dir / "submission_url.html", title=f"Submission URL — {a.get('name', '')}")
+            saved_anything = True
+
+        # Save grade/score info if available
+        grade = submission.get("grade")
+        score = submission.get("score")
+        if (grade or score) and saved_anything:
+            meta = f"""
+<div style="background: #f0f4f8; padding: 1rem; border-radius: 8px;">
+    <strong>Score:</strong> {score if score is not None else 'N/A'} / {a.get('points_possible', 'N/A')}
+    &nbsp;|&nbsp; <strong>Grade:</strong> {grade or 'N/A'}
+</div>"""
+            save_html(meta, sub_dir / "grade.html", title=f"Grade — {a.get('name', '')}")
+
+
+def download_discussions(course_id: int, course_dir: Path):
+    """Download announcements and discussion topics with their replies."""
+    discussions_dir = course_dir / "discussions"
+
+    for topic_type, label in [("announcements", "📢 Fetching announcements..."),
+                               ("discussion_topics", "💬 Fetching discussions...")]:
+        print(f"  {label}")
+
+        # Announcements use a different endpoint
+        if topic_type == "announcements":
+            endpoint = f"courses/{course_id}/discussion_topics"
+            params = {"per_page": 100, "only_announcements": "true"}
+        else:
+            endpoint = f"courses/{course_id}/discussion_topics"
+            params = {"per_page": 100}
+
+        topics = api_get(endpoint, params=params)
+        if not topics:
+            print(f"    (no {topic_type} found)")
+            continue
+
+        type_dir = discussions_dir / topic_type
+
+        for topic in topics:
+            if not isinstance(topic, dict):
+                continue
+
+            # Skip announcements when fetching regular discussions
+            if topic_type == "discussion_topics" and topic.get("is_announcement"):
+                continue
+
+            title = topic.get("title", "Untitled")
+            topic_id = topic["id"]
+            safe_title = sanitize_filename(title)
+
+            # Build the topic HTML
+            message = topic.get("message", "") or ""
+            posted_at = topic.get("posted_at", "Unknown date")
+            author = topic.get("author", {}).get("display_name", "Unknown") if isinstance(topic.get("author"), dict) else "Unknown"
+
+            content = f"""
+<div style="background: #f0f4f8; padding: 1rem; border-radius: 8px; margin-bottom: 1.5rem;">
+    <strong>Author:</strong> {author} &nbsp;|&nbsp;
+    <strong>Posted:</strong> {posted_at}
+</div>
+{message}"""
+
+            # Fetch replies
+            full_topic = api_get(f"courses/{course_id}/discussion_topics/{topic_id}/view")
+            if isinstance(full_topic, dict):
+                participants = {}
+                for p in full_topic.get("participants", []):
+                    if isinstance(p, dict):
+                        participants[p.get("id")] = p.get("display_name", "Unknown")
+
+                replies = full_topic.get("view", [])
+                if replies:
+                    content += "\n<h2>Replies</h2>"
+                    content += _render_replies(replies, participants)
+
+            save_html(content, type_dir / f"{safe_title}.html", title=title)
+
+
+def _render_replies(entries: list, participants: dict, depth: int = 0) -> str:
+    """Recursively render discussion replies as nested HTML."""
+    html = ""
+    indent = depth * 20
+    for entry in entries:
+        if not isinstance(entry, dict) or entry.get("deleted"):
+            continue
+        author_id = entry.get("user_id")
+        author = participants.get(author_id, "Unknown")
+        message = entry.get("message", "") or ""
+        created = entry.get("created_at", "")
+
+        html += f"""
+<div style="margin-left: {indent}px; border-left: 3px solid #ddd; padding: 0.5rem 1rem; margin-bottom: 0.5rem;">
+    <div style="color: #666; font-size: 0.9em;">
+        <strong>{author}</strong> &mdash; {created}
+    </div>
+    {message}
+</div>"""
+        # Recurse into sub-replies
+        sub_replies = entry.get("replies", [])
+        if sub_replies:
+            html += _render_replies(sub_replies, participants, depth + 1)
+    return html
+
+
 def generate_course_index(course_dir: Path, course_name: str):
-    """Generate an index.html listing all downloaded content for a course."""
+    """Generate an index.html listing all downloaded content for a course.
+
+    Always regenerated (not skipped if exists) since new content may have been
+    added since the last run.
+    """
     items = []
     for root, dirs, files in os.walk(course_dir):
         for fname in sorted(files):
@@ -356,7 +565,38 @@ def generate_course_index(course_dir: Path, course_name: str):
         return
 
     content = f"<ul>{''.join(items)}</ul>"
-    save_html(content, course_dir / "index.html", title=f"📚 {course_name} — Downloaded Materials")
+    dest_path = course_dir / "index.html"
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+
+    title = f"📚 {course_name} — Downloaded Materials"
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{title}</title>
+    <style>
+        body {{
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            max-width: 900px;
+            margin: 2rem auto;
+            padding: 0 1rem;
+            line-height: 1.6;
+            color: #333;
+        }}
+        h1 {{ color: #1a1a1a; border-bottom: 2px solid #eee; padding-bottom: 0.5rem; }}
+        a {{ color: #0066cc; }}
+    </style>
+</head>
+<body>
+<h1>{title}</h1>
+{content}
+</body>
+</html>"""
+
+    with open(dest_path, "w", encoding="utf-8") as f:
+        f.write(html)
+    print(f"    📄 Generated: index.html")
 
 
 def main():
@@ -399,6 +639,32 @@ def main():
         term = c.get("term", {}).get("name", "Unknown Term") if isinstance(c.get("term"), dict) else "Unknown Term"
         print(f"  {i:3}. {c.get('name', 'Unknown')} ({term})")
 
+    # Course selection
+    print(f"\nEnter course numbers to download (comma-separated), a range (e.g. 3-7),")
+    print(f"or press Enter to download all:")
+    selection = input("> ").strip()
+
+    if selection:
+        selected_indices = set()
+        for part in selection.split(","):
+            part = part.strip()
+            if "-" in part:
+                try:
+                    start, end = part.split("-", 1)
+                    selected_indices.update(range(int(start), int(end) + 1))
+                except ValueError:
+                    print(f"  ⚠ Invalid range: {part}")
+            else:
+                try:
+                    selected_indices.add(int(part))
+                except ValueError:
+                    print(f"  ⚠ Invalid number: {part}")
+        courses = [c for i, c in enumerate(courses, 1) if i in selected_indices]
+        if not courses:
+            print("No valid courses selected.")
+            sys.exit(1)
+        print(f"\n→ Selected {len(courses)} course(s)")
+
     print(f"\n{'='*60}")
     print("Starting download...\n")
 
@@ -425,6 +691,12 @@ def main():
 
             if DOWNLOAD_MODULES_AND_PAGES:
                 download_modules_and_pages(c["id"], course_dir)
+
+            if DOWNLOAD_SUBMISSIONS:
+                download_submissions(c["id"], course_dir)
+
+            if DOWNLOAD_DISCUSSIONS:
+                download_discussions(c["id"], course_dir)
 
             generate_course_index(course_dir, course_name)
             success_count += 1

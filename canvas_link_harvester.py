@@ -178,6 +178,27 @@ def classify_link(url: str) -> str:
 # CANVAS FILE / MEDIA DOWNLOAD
 # ──────────────────────────────────────────────
 
+MAX_RETRIES = 3
+
+
+def _request_with_retry(sess, url, max_retries=MAX_RETRIES, **kwargs):
+    """Make a request with retry on transient errors. Returns response or raises."""
+    for attempt in range(1, max_retries + 1):
+        time.sleep(REQUEST_DELAY)
+        try:
+            resp = sess.get(url, **kwargs)
+            if resp.status_code in (429, 500, 502, 503, 504) and attempt < max_retries:
+                time.sleep(REQUEST_DELAY * (2 ** attempt))
+                continue
+            return resp
+        except requests.exceptions.ConnectionError:
+            if attempt < max_retries:
+                time.sleep(REQUEST_DELAY * (2 ** attempt))
+                continue
+            raise
+    return resp  # return last response even if bad status
+
+
 def download_canvas_file(url: str, dest_dir: Path) -> tuple[bool, str]:
     """Resolve a Canvas file URL via the API and download it."""
     match = re.search(r"/files/(\d+)", url)
@@ -185,9 +206,8 @@ def download_canvas_file(url: str, dest_dir: Path) -> tuple[bool, str]:
         return False, "Could not extract file ID from URL"
     file_id = match.group(1)
 
-    time.sleep(REQUEST_DELAY)
     try:
-        resp = canvas_session.get(f"{CANVAS_BASE_URL}/api/v1/files/{file_id}")
+        resp = _request_with_retry(canvas_session, f"{CANVAS_BASE_URL}/api/v1/files/{file_id}")
         if resp.status_code == 404:
             return False, "404 — file no longer exists on Canvas"
         resp.raise_for_status()
@@ -204,9 +224,8 @@ def download_canvas_file(url: str, dest_dir: Path) -> tuple[bool, str]:
     if dest_path.exists():
         return True, f"Already exists: {filename}"
 
-    time.sleep(REQUEST_DELAY)
     try:
-        dl = canvas_session.get(file_info["url"], stream=True, allow_redirects=True)
+        dl = _request_with_retry(canvas_session, file_info["url"], stream=True, allow_redirects=True)
         dl.raise_for_status()
         dest_dir.mkdir(parents=True, exist_ok=True)
         with open(dest_path, "wb") as f:
@@ -222,9 +241,8 @@ def download_canvas_media(url: str, dest_dir: Path) -> tuple[bool, str]:
     if url.startswith("/"):
         url = CANVAS_BASE_URL.rstrip("/") + url
 
-    time.sleep(REQUEST_DELAY)
     try:
-        resp = canvas_session.get(url, stream=True, allow_redirects=True, timeout=WEBPAGE_TIMEOUT)
+        resp = _request_with_retry(canvas_session, url, stream=True, allow_redirects=True, timeout=WEBPAGE_TIMEOUT)
         if resp.status_code == 404:
             return False, "404 — media no longer exists on Canvas"
         resp.raise_for_status()
@@ -292,8 +310,7 @@ def download_google_file(url: str, link_type: str, dest_dir: Path) -> tuple[bool
             continue
 
         try:
-            time.sleep(REQUEST_DELAY)
-            resp = plain_session.get(export_url, timeout=WEBPAGE_TIMEOUT, allow_redirects=True)
+            resp = _request_with_retry(plain_session, export_url, timeout=WEBPAGE_TIMEOUT, allow_redirects=True)
 
             if "accounts.google.com" in resp.url:
                 results.append(f"Private — requires Google login ({ext})")
@@ -344,9 +361,8 @@ CONTENT_TYPE_EXT = {
 def download_webpage(url: str, dest_dir: Path) -> tuple[bool, str]:
     """Download a webpage or direct file link to dest_dir."""
     try:
-        time.sleep(REQUEST_DELAY)
-        resp = plain_session.get(
-            url, timeout=WEBPAGE_TIMEOUT, allow_redirects=True, stream=True
+        resp = _request_with_retry(
+            plain_session, url, timeout=WEBPAGE_TIMEOUT, allow_redirects=True, stream=True
         )
         resp.raise_for_status()
     except requests.exceptions.HTTPError:
