@@ -104,7 +104,16 @@ class _LinkExtractor(HTMLParser):
 
     def handle_starttag(self, tag, attrs):
         attrs_dict = dict(attrs)
-        for attr in ("href", "src", "data-api-endpoint"):
+        # Determine which attributes carry URLs for this tag type
+        if tag == "object":
+            candidates = ("data", "data-url", "data-download-url")
+        elif tag == "form":
+            candidates = ("action",)
+        else:
+            # <a>, <img>, <embed>, <iframe>, <script>, <link>, and any Canvas
+            # RCE element that uses data-url / data-download-url / data-api-endpoint
+            candidates = ("href", "src", "data-api-endpoint", "data-url", "data-download-url")
+        for attr in candidates:
             val = attrs_dict.get(attr, "")
             if val and not val.startswith(("#", "mailto:", "javascript:", "data:")):
                 self.links.add(val)
@@ -138,7 +147,7 @@ def classify_link(url: str) -> str:
     """
     Returns one of:
       canvas_file | canvas_media | google_slides | google_doc |
-      google_sheet | webpage | skip
+      google_sheet | pdf_direct | webpage | skip
     """
     try:
         parsed = urlparse(url)
@@ -169,6 +178,10 @@ def classify_link(url: str) -> str:
         return "skip"
 
     if parsed.scheme in ("http", "https"):
+        # Treat URLs whose path ends with .pdf as a dedicated type so they are
+        # saved correctly even when the server returns a misleading Content-Type.
+        if path.lower().endswith(".pdf"):
+            return "pdf_direct"
         return "webpage"
 
     return "skip"
@@ -270,6 +283,49 @@ def download_canvas_media(url: str, dest_dir: Path) -> tuple[bool, str]:
         return True, f"Downloaded: {dest_path.name}"
     except Exception as e:
         return False, f"Download failed: {e}"
+
+
+# ──────────────────────────────────────────────
+# DIRECT PDF DOWNLOAD
+# ──────────────────────────────────────────────
+
+def download_pdf_direct(url: str, dest_dir: Path) -> tuple[bool, str]:
+    """Download a URL whose path ends with .pdf.
+
+    Accepts application/pdf and application/octet-stream responses, and also
+    accepts any content when the server omits or misreports the Content-Type —
+    as long as the URL path itself ends with .pdf.  Returns failure if the
+    server redirects to an HTML login page.
+    """
+    parsed = urlparse(url)
+    raw_name = parsed.path.rstrip("/").split("/")[-1] or "download"
+    filename = sanitize_filename(raw_name)
+    if not filename.lower().endswith(".pdf"):
+        filename += ".pdf"
+    dest_path = dest_dir / filename
+
+    if dest_path.exists():
+        return True, f"Already exists: {dest_path.name}"
+
+    try:
+        resp = _request_with_retry(
+            plain_session, url, timeout=WEBPAGE_TIMEOUT, allow_redirects=True, stream=True
+        )
+        resp.raise_for_status()
+    except requests.exceptions.HTTPError:
+        return False, f"HTTP {resp.status_code}"
+    except Exception as e:
+        return False, f"Request failed: {e}"
+
+    content_type = resp.headers.get("content-type", "").lower().split(";")[0].strip()
+    if "text/html" in content_type:
+        return False, "Got HTML page instead of PDF (likely auth-gated or deleted)"
+
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    with open(dest_path, "wb") as f:
+        for chunk in resp.iter_content(8192):
+            f.write(chunk)
+    return True, f"Downloaded: {dest_path.name}"
 
 
 # ──────────────────────────────────────────────
@@ -384,6 +440,26 @@ def download_webpage(url: str, dest_dir: Path) -> tuple[bool, str]:
                 f.write(chunk)
         return True, f"Downloaded file: {dest_path.name}"
 
+    # application/octet-stream is a generic "binary blob" type — many servers
+    # use it for forced-download links regardless of actual file type.  Fall
+    # back to the URL path extension so we don't discard real files.
+    if content_type == "application/octet-stream":
+        path_lower = urlparse(resp.url).path.lower()
+        ext = next(
+            (e for e in CONTENT_TYPE_EXT.values() if path_lower.endswith(e)),
+            None,
+        )
+        if ext:
+            dest_path = dest_dir / f"{base_name}{ext}"
+            if dest_path.exists():
+                return True, f"Already exists: {dest_path.name}"
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            with open(dest_path, "wb") as f:
+                for chunk in resp.iter_content(8192):
+                    f.write(chunk)
+            return True, f"Downloaded file: {dest_path.name}"
+        return False, "application/octet-stream with unrecognised extension"
+
     if content_type == "text/html":
         html = resp.text
         title = title_from_html(html)
@@ -456,6 +532,8 @@ def process_html_file(html_path: Path, file_manifest: dict, run_stats: dict) -> 
             ok, msg = download_canvas_media(url, dest_dir)
         elif link_type in ("google_slides", "google_doc", "google_sheet"):
             ok, msg = download_google_file(url, link_type, dest_dir)
+        elif link_type == "pdf_direct":
+            ok, msg = download_pdf_direct(url, dest_dir)
         else:
             ok, msg = download_webpage(url, dest_dir)
 
@@ -466,6 +544,8 @@ def process_html_file(html_path: Path, file_manifest: dict, run_stats: dict) -> 
             "type": link_type,
         }
         run_stats["downloaded" if ok else "failed"] += 1
+        if ok and link_type == "pdf_direct":
+            run_stats["pdfs"] += 1
 
     return file_manifest
 
@@ -493,7 +573,7 @@ def main():
     print(f"   Found {len(html_files)} HTML files to scan\n")
 
     manifest = load_manifest()
-    run_stats = {"downloaded": 0, "failed": 0, "skipped": 0}
+    run_stats = {"downloaded": 0, "failed": 0, "skipped": 0, "pdfs": 0}
 
     for html_path in html_files:
         rel_path = str(html_path.relative_to(DOWNLOAD_DIR))
@@ -506,6 +586,7 @@ def main():
     print("✅ LINK HARVEST COMPLETE")
     print(f"{'='*60}")
     print(f"  Downloaded this run : {run_stats['downloaded']}")
+    print(f"  PDFs downloaded     : {run_stats['pdfs']}")
     print(f"  Failed this run     : {run_stats['failed']}")
     print(f"  Skipped (no-op)     : {run_stats['skipped']}")
     print(f"  Manifest saved to   : {MANIFEST_FILE}")
