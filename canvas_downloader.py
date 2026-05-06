@@ -313,6 +313,8 @@ def download_assignments(course_id: int, course_dir: Path):
             content += "</table>"
 
         save_html(content, assignments_dir / f"{name}.html", title=a.get("name", "Assignment"))
+        # Note: PDF/file links embedded in the assignment HTML are resolved
+        # by canvas_link_harvester.py (run it after this script).
 
 
 def download_modules_and_pages(course_id: int, course_dir: Path):
@@ -354,6 +356,8 @@ def download_modules_and_pages(course_id: int, course_dir: Path):
                         if isinstance(page, dict):
                             body = page.get("body", "") or ""
                             save_html(body, mod_dir / f"{item_title}.html", title=item.get("title", "Page"))
+                            # Note: PDF/file links embedded in the page body are
+                            # resolved by canvas_link_harvester.py.
 
                 elif item_type == "File":
                     # Download the file

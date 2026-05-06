@@ -13,6 +13,11 @@ A pair of Python scripts for archiving your Canvas LMS course materials to local
 
 Run them in order: downloader first, harvester second.
 
+> **PDFs embedded as links inside pages, assignments, or discussions are only
+> downloaded in Step 2.** Step 1 saves those pages as HTML files; Step 2 scans
+> those HTML files and pulls down every PDF (and other linked file) it finds.
+> Always run both scripts for complete coverage.
+
 ---
 
 ## Requirements
@@ -82,7 +87,8 @@ This scans every HTML file produced by Step 1 and attempts to download anything 
 | Google Slides | Exported as both PDF and PPTX |
 | Google Doc | Exported as PDF |
 | Google Sheet | Exported as XLSX |
-| Any other webpage or direct file URL | Downloaded as HTML or the raw file (PDF, DOCX, ZIP, etc.) based on `Content-Type` |
+| **Direct PDF link** (URL ends in `.pdf`) | **Downloaded directly as a PDF file**, regardless of `Content-Type` header |
+| Any other webpage or direct file URL | Downloaded as HTML or the raw file (PDF, DOCX, ZIP, etc.) based on `Content-Type`; `application/octet-stream` responses fall back to the URL extension |
 | YouTube, Vimeo, social media | Skipped silently |
 | Canvas UI pages (assignment pages, etc.) | Skipped silently |
 
@@ -149,8 +155,9 @@ The harvester is also re-run safe — every processed link is recorded in `~/CMU
 - Course files (PDFs, DOCX, PPTX, ZIP, images) uploaded directly to Canvas
 - Assignment and rubric HTML
 - Canvas page content
+- **PDFs linked inside pages, assignments, and discussions** — the harvester catches direct `.pdf` links, Canvas file embeds, `<object>`/`<embed>` tags, and Canvas RCE `data-url`/`data-download-url` attributes
 - Publicly shared Google Slides, Docs, and Sheets
-- Webpages and direct file downloads linked from pages
+- Webpages and direct file downloads linked from pages (including `application/octet-stream` responses identified by URL extension)
 - Module-linked files
 
 ### What will fail or produce limited results
