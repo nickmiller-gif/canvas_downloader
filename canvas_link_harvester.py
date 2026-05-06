@@ -449,8 +449,6 @@ def download_webpage(url: str, dest_dir: Path) -> tuple[bool, str]:
             (e for e in CONTENT_TYPE_EXT.values() if path_lower.endswith(e)),
             None,
         )
-        if ext is None and path_lower.endswith(".pdf"):
-            ext = ".pdf"
         if ext:
             dest_path = dest_dir / f"{base_name}{ext}"
             if dest_path.exists():
@@ -546,7 +544,7 @@ def process_html_file(html_path: Path, file_manifest: dict, run_stats: dict) -> 
             "type": link_type,
         }
         run_stats["downloaded" if ok else "failed"] += 1
-        if ok and (link_type == "pdf_direct" or msg.endswith(".pdf")):
+        if ok and link_type == "pdf_direct":
             run_stats["pdfs"] += 1
 
     return file_manifest
